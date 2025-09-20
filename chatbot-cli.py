@@ -1,175 +1,208 @@
 import os
-import google.generativeai as genai
-from opensearchpy import OpenSearch, RequestsHttpConnection
-from sentence_transformers import SentenceTransformer
 import sys
+from sentence_transformers import SentenceTransformer
+from opensearchpy import OpenSearch, RequestsHttpConnection, OpenSearchException
+import google.generativeai as genai
 import json
+from dotenv import load_dotenv # Import the dotenv library
 
-# --- Configuration ---
-GEMINI_API_KEY = "AIzaSyDHeGlRZOU4Z311enKGFyH5m7LV3-NHqco" # Use your actual Gemini API key
-OPENSEARCH_PASSWORD = "OpenSearch!2025" # The password you set in docker-compose.yml
+# --- Configurations ---
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-# --- Configure Models ---
-try:
-    # LLM for generating answers
-    genai.configure(api_key=GEMINI_API_KEY)
-    llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
-    
-    # Embedding model to match your data (all-MiniLM-L6-v2)
-    # UPDATED: Load the model from the user-specified local directory.
-    print("Loading embedding model from local files...")
-    local_model_path = "./all-MiniLM-L6-v2"  # Path to the folder with model files
-    if not os.path.isdir(local_model_path):
-        print(f"Error: The local model directory was not found at '{local_model_path}'", file=sys.stderr)
-        print("Please follow the instructions in manual_model_download.md to download the model files.", file=sys.stderr)
-        sys.exit(1)
-        
-    embedding_model = SentenceTransformer(local_model_path) 
-    print("Embedding model loaded.")
+# --- LLM and Embedding Model Setup ---
+# The API key will be loaded from the environment, not hardcoded.
+LOCAL_MODEL_PATH = "all-MiniLM-L6-v2"
 
-except Exception as e:
-    print(f"Error configuring models: {e}", file=sys.stderr)
-    print("Please ensure your API key is valid.", file=sys.stderr)
-    sys.exit(1)
+# --- OpenSearch Connection Details ---
+HOST = 'localhost'
+PORT = 9200
+OPENSEARCH_PASSWORD = "OpenSearch!2025"
+AUTH = ('admin', OPENSEARCH_PASSWORD)
+INDEX_NAME = 'products'
 
 
-# --- OpenSearch Connection ---
-host = 'localhost'
-port = 9200
-auth = ('admin', OPENSEARCH_PASSWORD)
-index_name = 'products'
-
-try:
-    client = OpenSearch(
-        hosts=[{'host': host, 'port': port}],
-        http_auth=auth,
-        use_ssl=True,
-        verify_certs=False,
-        ssl_assert_hostname=False,
-        ssl_show_warn=False,
-        connection_class=RequestsHttpConnection
-    )
-    if not client.ping():
-        raise ConnectionError("Could not connect to OpenSearch.")
-except Exception as e:
-    print(f"Error connecting to OpenSearch: {e}", file=sys.stderr)
-    print("Please ensure your OpenSearch cluster is running and accessible.", file=sys.stderr)
-    sys.exit(1)
-
-
-def get_embedding(text):
-    """Generates a vector embedding for the given text using SentenceTransformer."""
+def initialize_models():
+    """Initializes and returns the Gemini and SentenceTransformer models."""
+    print("Initializing Gemini model...")
     try:
-        # The encode function returns a NumPy array, which we convert to a list
-        return embedding_model.encode(text).tolist()
+        # Load environment variables from the .env file
+        load_dotenv()
+        # Get the API key from the environment
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            print("Fatal Error: GEMINI_API_KEY not found in the .env file.", file=sys.stderr)
+            print("Please create a '.env' file and add your key (e.g., GEMINI_API_KEY='YOUR_KEY').", file=sys.stderr)
+            sys.exit(1)
+
+        genai.configure(api_key=gemini_api_key)
+        llm_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        print("Gemini model initialized.")
     except Exception as e:
-        print(f"Error generating embedding: {e}", file=sys.stderr)
-        return None
+        print(f"Fatal Error: Could not configure Gemini model. Check your API key. Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-
-def ask_chatbot(question):
-    """
-    Performs a hybrid search (vector + keyword) and uses the LLM to generate an answer.
-    """
+    print("Loading local embedding model (this may take a moment)...")
     try:
-        # 1. Generate an embedding for the user's question
-        print("Generating embedding for your question...")
-        query_vector = get_embedding(question)
-        if query_vector is None:
-            return "Sorry, I couldn't process your question to generate an embedding."
+        if not os.path.isdir(LOCAL_MODEL_PATH):
+            print(f"Error: The local model folder '{LOCAL_MODEL_PATH}' was not found.", file=sys.stderr)
+            sys.exit(1)
+        embedding_model = SentenceTransformer(LOCAL_MODEL_PATH)
+        print("Embedding model loaded.")
+    except Exception as e:
+        print(f"Fatal Error: Could not load the SentenceTransformer model from '{LOCAL_MODEL_PATH}'. Error: {e}",
+              file=sys.stderr)
+        sys.exit(1)
 
-        # 2. Perform a Hybrid Search in OpenSearch
+    return llm_model, embedding_model
+
+
+def initialize_opensearch_client():
+    """Initializes and returns the OpenSearch client."""
+    try:
+        client = OpenSearch(
+            hosts=[{'host': HOST, 'port': PORT}],
+            http_auth=AUTH,
+            use_ssl=True,
+            verify_certs=False,
+            ssl_assert_hostname=False,
+            ssl_show_warn=False,
+            connection_class=RequestsHttpConnection
+        )
+        if not client.ping():
+            raise ConnectionError("Could not connect to OpenSearch.")
+        return client
+    except Exception as e:
+        print(f"Error connecting to OpenSearch: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _print_item(item, indent="  "):
+    """Recursively prints nested dictionaries and lists for clear display."""
+    for key, value in item.items():
+        if 'embedding' in key.lower():  # Skip all embedding fields
+            continue
+        if value is None or value == '':
+            continue
+
+        if isinstance(value, dict):
+            print(f"{indent}{key}:")
+            _print_item(value, indent + "  ")
+        elif isinstance(value, list):
+            print(f"{indent}{key}:")
+            for i, list_item in enumerate(value):
+                if isinstance(list_item, dict):
+                    print(f"{indent}  - Item {i+1}:")
+                    _print_item(list_item, indent + "    ")
+                else:
+                    print(f"{indent}  - {list_item}")
+        else:
+            print(f"{indent}{key}: {value}")
+
+
+def format_and_print_results(search_results):
+    """Formats and prints the search results for clarity."""
+    print("\n--- Data Retrieved from Database ---")
+    if not search_results:
+        print("No relevant documents found.")
+        return
+
+    for i, hit in enumerate(search_results, 1):
+        print(f"\n[Result {i}] (Score: {hit['_score']:.2f})")
+        _print_item(hit['_source'])
+    print("------------------------------------\n")
+
+
+def ask_chatbot(question, client, llm_model, embedding_model):
+    """Handles chatbot logic: embedding, hybrid search, and answer generation."""
+    try:
+        print("Generating embedding for your question...")
+        question_embedding = embedding_model.encode(question)
+
+        # UPDATED: Simplified hybrid query with a single, powerful vector search
         search_body = {
-            "size": 5, 
             "query": {
                 "hybrid": {
                     "queries": [
                         {
                             "multi_match": {
                                 "query": question,
-                                "fields": ["productDescription", "feature", "designBlock", "ipReference", "partNumber", "description"]
+                                "fields": ["partNumber", "productDescription", "features.feature", "designIPs.designBlocks", "designIPs.description"]
                             }
                         },
                         {
                             "knn": {
-                                "featureEmbedding": { "vector": query_vector, "k": 5 }
-                            }
-                        },
-                        {
-                            "knn": {
-                                "productDescriptionEmbedding": { "vector": query_vector, "k": 5 }
-                            }
-                        },
-                        {
-                            "knn": {
-                                "descriptionEmbedding": { "vector": query_vector, "k": 5 }
+                                "doc_embedding": {
+                                    "vector": question_embedding.tolist(),
+                                    "k": 5
+                                }
                             }
                         }
                     ]
                 }
-            }
+            },
+            "size": 5
         }
-        
+
         print("Searching database...")
-        response = client.search(index=index_name, body=search_body)
-        search_results = [hit['_source'] for hit in response['hits']['hits']]
+        response = client.search(index=INDEX_NAME, body=search_body)
+        
+        # Pass the full hits with scores to the display function
+        search_hits = response['hits']['hits']
+        format_and_print_results(search_hits)
+        
+        search_results = [hit['_source'] for hit in search_hits]
 
         if not search_results:
-            return "I couldn't find any information related to your question in the database."
+            return "I could not find any relevant information in the database to answer your question."
 
-        # ADDED: Print the retrieved data before sending it to the LLM
-        print("\n--- Data retrieved from database ---")
-        # Use json.dumps for pretty printing the list of dictionaries
-        # We will filter out the large embedding vectors for readability
-        cleaned_results = []
-        for result in search_results:
-            cleaned_item = {k: v for k, v in result.items() if 'Embedding' not in k}
-            cleaned_results.append(cleaned_item)
-        
-        print(json.dumps(cleaned_results, indent=2))
-        print("------------------------------------\n")
-
-
-        # 3. Augment with LLM for final answer generation
         prompt = f"""
-        You are a helpful assistant for a product database.
-        Answer the following question based ONLY on the provided search results.
-        If the information is not in the results, state that you cannot find the answer in the provided data.
-        Be concise and clear in your answer.
+        You are an expert engineering assistant. Your task is to answer the user's question based *only* on the provided search results from a product database.
+        Synthesize the information from all the provided documents to form a comprehensive and accurate answer.
+        - If the results contain a clear answer, provide it directly.
+        - If the results contain multiple relevant parts, combine the information logically.
+        - Always mention the specific 'partNumber' or 'designBlocks' you are referring to.
+        - If the provided search results do not contain enough information to answer the question, state that clearly. Do not make up information.
 
-        Question: "{question}"
+        User's Question: {question}
 
         Search Results:
-        {search_results}
+        {json.dumps(search_results, indent=2)}
 
         Answer:
         """
 
-        print("Generating answer...")
         llm_response = llm_model.generate_content(prompt)
         return llm_response.text
 
+    except OpenSearchException as e:
+        return f"An error occurred while querying the database: {e}"
     except Exception as e:
-        return f"An error occurred: {e}"
+        return f"An unexpected error occurred: {e}"
 
 def main():
-    """Main function to run the chatbot in a loop."""
+    """Main function to run the CLI chatbot."""
+    llm_model, embedding_model = initialize_models()
+    opensearch_client = initialize_opensearch_client()
+
     print("\nProduct Chatbot (Vector Search Enabled) Initialized.")
     print("Type 'quit' or 'exit' to end the session.")
-    print("-" * 30)
+    print("------------------------------")
 
     while True:
-        user_question = input("You: ")
-        if user_question.lower() in ['quit', 'exit']:
-            print("Bot: Goodbye!")
+        try:
+            user_question = input("You: ")
+            if user_question.lower() in ['quit', 'exit']:
+                break
+
+            bot_answer = ask_chatbot(user_question, opensearch_client, llm_model, embedding_model)
+            print(f"\nBot: {bot_answer}\n")
+
+        except KeyboardInterrupt:
             break
-        
-        if not user_question.strip():
-            continue
+        except Exception as e:
+            print(f"\nAn error occurred: {e}\n", file=sys.stderr)
 
-        answer = ask_chatbot(user_question)
-        print(f"\nBot: {answer}\n")
-
+    print("\nChat session ended. Goodbye!")
 
 if __name__ == '__main__':
     main()
