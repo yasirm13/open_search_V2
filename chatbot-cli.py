@@ -3,6 +3,7 @@ import google.generativeai as genai
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from sentence_transformers import SentenceTransformer
 import sys
+import json
 
 # --- Configuration ---
 GEMINI_API_KEY = "AIzaSyDHeGlRZOU4Z311enKGFyH5m7LV3-NHqco" # Use your actual Gemini API key
@@ -115,6 +116,19 @@ def ask_chatbot(question):
 
         if not search_results:
             return "I couldn't find any information related to your question in the database."
+
+        # ADDED: Print the retrieved data before sending it to the LLM
+        print("\n--- Data retrieved from database ---")
+        # Use json.dumps for pretty printing the list of dictionaries
+        # We will filter out the large embedding vectors for readability
+        cleaned_results = []
+        for result in search_results:
+            cleaned_item = {k: v for k, v in result.items() if 'Embedding' not in k}
+            cleaned_results.append(cleaned_item)
+        
+        print(json.dumps(cleaned_results, indent=2))
+        print("------------------------------------\n")
+
 
         # 3. Augment with LLM for final answer generation
         prompt = f"""
